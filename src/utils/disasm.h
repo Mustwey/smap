@@ -12,13 +12,13 @@
 namespace utils::disasm {
 
 // decoder / formatter singletons ------------------------------------------------
-inline const ZydisDecoder& decoder() {
+[[nodiscard]] inline const ZydisDecoder& decoder() noexcept {
   static ZydisDecoder d;
   static bool init = (ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64), true);
   (void)init;
   return d;
 }
-inline const ZydisFormatter& formatter() {
+[[nodiscard]] inline const ZydisFormatter& formatter() noexcept {
   static ZydisFormatter f;
   static bool init = (ZydisFormatterInit(&f, ZYDIS_FORMATTER_STYLE_INTEL),
                       ZydisFormatterSetProperty(&f, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE), true);
@@ -63,9 +63,10 @@ format(const ZydisDecodedInstruction& inst, const void* addr = nullptr) noexcept
 }
 
 // register helpers -------------------------------------------------------------
+constexpr size_t k_gp_count = (ZYDIS_REGISTER_R15 - ZYDIS_REGISTER_RAX) + 1;
 inline constexpr ZydisRegister to_64(ZydisRegister r) noexcept {
   return (r >= ZYDIS_REGISTER_AX && r <= ZYDIS_REGISTER_R15)
-             ? static_cast<ZydisRegister>(((r - ZYDIS_REGISTER_AX) % 15) + ZYDIS_REGISTER_RAX)
+             ? static_cast<ZydisRegister>(((r - ZYDIS_REGISTER_AX) % k_gp_count) + ZYDIS_REGISTER_RAX)
              : r;
 }
 
@@ -75,23 +76,28 @@ inline constexpr bool same_register(ZydisRegister a, ZydisRegister b) noexcept {
 
 [[nodiscard]] inline std::optional<ZydisRegister>
 unused_gp(const ZydisDecodedInstruction& inst) noexcept {
-  static constexpr ZydisRegister all[15] = {
-      ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX, ZYDIS_REGISTER_RBX,
-      ZYDIS_REGISTER_RBP, ZYDIS_REGISTER_RSI, ZYDIS_REGISTER_RDI, ZYDIS_REGISTER_R8,
-      ZYDIS_REGISTER_R9,  ZYDIS_REGISTER_R10, ZYDIS_REGISTER_R11, ZYDIS_REGISTER_R12,
+  static constexpr std::array<ZydisRegister, 15> k_gp_regs = {
+      ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX,
+      ZYDIS_REGISTER_RBX, ZYDIS_REGISTER_RBP, ZYDIS_REGISTER_RSI,
+      ZYDIS_REGISTER_RDI, ZYDIS_REGISTER_R8,  ZYDIS_REGISTER_R9,
+      ZYDIS_REGISTER_R10, ZYDIS_REGISTER_R11, ZYDIS_REGISTER_R12,
       ZYDIS_REGISTER_R13, ZYDIS_REGISTER_R14, ZYDIS_REGISTER_R15};
 
-  std::bitset<15> used;
-  for_operands(inst, [&](const ZydisDecodedOperand& op){
+  std::bitset<k_gp_regs.size()> used;
+  for_operands(inst, [&](const ZydisDecodedOperand& op) {
     if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-      ZydisRegister r = to_64(op.reg.value);
-      for (size_t i = 0; i < 15; ++i) if (all[i] == r) used.set(i);
+      const ZydisRegister r = to_64(op.reg.value);
+      for (size_t i = 0; i < k_gp_regs.size(); ++i)
+        if (k_gp_regs[i] == r) used.set(i);
     } else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-      ZydisRegister b = to_64(op.mem.base), i = to_64(op.mem.index);
-      for (size_t n = 0; n < 15; ++n) if (all[n] == b || all[n] == i) used.set(n);
+      const ZydisRegister b = to_64(op.mem.base);
+      const ZydisRegister i = to_64(op.mem.index);
+      for (size_t n = 0; n < k_gp_regs.size(); ++n)
+        if (k_gp_regs[n] == b || k_gp_regs[n] == i) used.set(n);
     }
   });
-  for (size_t i = 0; i < 15; ++i) if (!used.test(i)) return all[i];
+  for (size_t i = 0; i < k_gp_regs.size(); ++i)
+    if (!used.test(i)) return k_gp_regs[i];
   return std::nullopt;
 }
 
