@@ -3,10 +3,13 @@
 // disasm.h – minimal Zydis helpers (decode/format/regs).
 
 #include <Zydis/Zydis.h>
-#include <optional>
-#include <string>
+#include <algorithm>
+#include <array>
 #include <bitset>
+#include <cstdint>
+#include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace utils::disasm {
@@ -14,14 +17,18 @@ namespace utils::disasm {
 // decoder / formatter singletons ------------------------------------------------
 [[nodiscard]] inline const ZydisDecoder& decoder() noexcept {
   static ZydisDecoder d;
-  static bool init = (ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64), true);
+  static bool init =
+      (ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64),
+       true);
   (void)init;
   return d;
 }
 [[nodiscard]] inline const ZydisFormatter& formatter() noexcept {
   static ZydisFormatter f;
-  static bool init = (ZydisFormatterInit(&f, ZYDIS_FORMATTER_STYLE_INTEL),
-                      ZydisFormatterSetProperty(&f, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE), true);
+  static bool init =
+      (ZydisFormatterInit(&f, ZYDIS_FORMATTER_STYLE_INTEL),
+       ZydisFormatterSetProperty(&f, ZYDIS_FORMATTER_PROP_FORCE_SIZE, ZYAN_TRUE),
+       true);
   (void)init;
   return f;
 }
@@ -29,10 +36,16 @@ namespace utils::disasm {
 // core -------------------------------------------------------------------------
 [[nodiscard]] inline std::optional<ZydisDecodedInstruction>
 decode(const void* code, size_t size) noexcept {
+  size = std::min<size_t>(size, ZYDIS_MAX_INSTRUCTION_LENGTH);
   ZydisDecodedInstruction inst{};
   if (ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&decoder(), code, size, &inst)))
     return inst;
   return std::nullopt;
+}
+
+[[nodiscard]] inline std::optional<ZydisDecodedInstruction>
+decode(const void* code) noexcept {
+  return decode(code, ZYDIS_MAX_INSTRUCTION_LENGTH);
 }
 
 [[nodiscard]] inline std::optional<ZydisDecodedInstruction>
