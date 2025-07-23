@@ -1,0 +1,54 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{6D335F4E-7BBA-4C93-87A7-FF043BF35E29}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\\asmjit">
+      <UniqueIdentifier>{A1B2C3D4-E5F6-47A8-9B0C-D1E2F3A4B5C6}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\\asmtk">
+      <UniqueIdentifier>{B2C3D4E5-F6A7-48B9-0C1D-E2F3A4B5C6D7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\\asmjit">
+      <UniqueIdentifier>{C3D4E5F6-A7B8-49C0-D1E2-F3A4B5C6D7E8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\\asmtk">
+      <UniqueIdentifier>{D4E5F6A7-B8C9-40D1-E2F3-A4B5C6D7E8F9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\\zydis">
+      <UniqueIdentifier>{E5F6A7B8-C9D0-41E2-F3A4-B5C6D7E8F9A0}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\**\*.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ext\asmjit\src\**\*.cpp">
+      <Filter>Source Files\\asmjit</Filter>
+    </ClCompile>
+    <ClCompile Include="ext\asmtk\src\**\*.cpp">
+      <Filter>Source Files\\asmtk</Filter>
+    </ClCompile>
+
+    <ClInclude Include="src\**\*.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ext\asmjit\src\**\*.h">
+      <Filter>Header Files\\asmjit</Filter>
+    </ClInclude>
+    <ClInclude Include="ext\asmtk\src\**\*.h">
+      <Filter>Header Files\\asmtk</Filter>
+    </ClInclude>
+    <ClInclude Include="ext\zydis\include\**\*.h">
+      <Filter>Header Files\\zydis</Filter>
+    </ClInclude>
+    <ClInclude Include="ext\zydis\dependencies\zycore\**\*.h">
+      <Filter>Header Files\\zydis</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
