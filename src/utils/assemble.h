@@ -9,6 +9,7 @@
 #include <asmtk/asmtk.h>
 
 #include <cstdarg>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -21,17 +22,22 @@ constexpr size_t k_stack_buf = 512;
 [[nodiscard]] inline std::optional<std::vector<uint8_t>>
 assemble(std::string_view text) noexcept {
   asmjit::CodeHolder code;
-  asmjit::Environment env{asmjit::Arch::kX64};
-  if (code.init(env) != asmjit::kErrorOk)
+  if (code.init(asmjit::Environment::host()) != asmjit::kErrorOk)
     return std::nullopt;
 
-  asmjit::x86::Assembler a(&code);
-  asmtk::AsmParser p(&a);
-  if (p.parse(text.data(), text.size()) != asmjit::kErrorOk)
+  asmjit::x86::Assembler assembler(&code);
+  asmtk::AsmParser parser(&assembler);
+  if (parser.parse(text.data(), text.size()) != asmjit::kErrorOk)
     return std::nullopt;
 
-  const auto& buf = code.textSection()->buffer();
-  return std::vector<uint8_t>(buf.data(), buf.data() + buf.size());
+  if (code.flatten() != asmjit::kErrorOk)
+    return std::nullopt;
+
+  std::vector<uint8_t> out(code.codeSize());
+  if (code.copyFlattenedData(out.data(), out.size()) != asmjit::kErrorOk)
+    return std::nullopt;
+
+  return out;
 }
 
 [[nodiscard]] inline std::optional<std::vector<uint8_t>>
