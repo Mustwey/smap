@@ -1,73 +1,103 @@
 #pragma once
 
-// process.h – tiny helpers around Win32 Toolhelp API (no wrappers, no RAII).
+// process.h – minimal Win32 Toolhelp helpers.
 // Provides:
-//   get_process(const wchar_t* name)                -> optional<PROCESSENTRY32>
-//   get_module (HANDLE proc, const wchar_t* name)   -> optional<MODULEENTRY32>
+//   get_process(std::wstring_view name)             -> optional<PROCESSENTRY32W>
+//   get_module(HANDLE proc, std::wstring_view name) -> optional<MODULEENTRY32W>
 //   list_modules(HANDLE proc)                       -> vector<ModuleInfo>
-// A ModuleInfo contains MODULEENTRY32 and its section headers.
+// A ModuleInfo contains MODULEENTRY32W and its section headers.
 
 #include <Windows.h>
 #include <TlHelp32.h>
-
+#include <cstdint>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace utils::process {
 
-constexpr DWORD k_snap_modules = TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32;
+constexpr DWORD kSnapModules = TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32;
+using byte_t = std::uint8_t;
 
-using byte_t = unsigned char;
+class Snapshot {
+ public:
+  Snapshot(DWORD flags, DWORD pid = 0) noexcept
+      : handle_(CreateToolhelp32Snapshot(flags, pid)) {}
+  Snapshot(const Snapshot&) = delete;
+  Snapshot& operator=(const Snapshot&) = delete;
+  Snapshot(Snapshot&& other) noexcept : handle_(other.handle_) {
+    other.handle_ = INVALID_HANDLE_VALUE;
+  }
+  Snapshot& operator=(Snapshot&& other) noexcept {
+    if (this != &other) {
+      reset();
+      handle_ = other.handle_;
+      other.handle_ = INVALID_HANDLE_VALUE;
+    }
+    return *this;
+  }
+  ~Snapshot() { reset(); }
+
+  [[nodiscard]] bool valid() const noexcept {
+    return handle_ != INVALID_HANDLE_VALUE;
+  }
+  [[nodiscard]] HANDLE get() const noexcept { return handle_; }
+
+ private:
+  void reset() noexcept {
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      CloseHandle(handle_);
+      handle_ = INVALID_HANDLE_VALUE;
+    }
+  }
+
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
 // -------------------------- helpers ----------------------------------------
-[[nodiscard]] inline bool iequals(const wchar_t* a, const wchar_t* b) noexcept {
-  return _wcsicmp(a, b) == 0;
+
+[[nodiscard]] inline bool iequals(std::wstring_view a, std::wstring_view b) noexcept {
+  return _wcsicmp(a.data(), b.data()) == 0;
 }
 
 // -------------------------- core API ---------------------------------------
-[[nodiscard]] inline std::optional<PROCESSENTRY32>
-get_process(const wchar_t* exe) noexcept {
-  const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snap == INVALID_HANDLE_VALUE) return std::nullopt;
 
-  PROCESSENTRY32 e{sizeof(e)};
-  if (Process32First(snap, &e)) {
+[[nodiscard]] inline std::optional<PROCESSENTRY32W>
+get_process(std::wstring_view exe) noexcept {
+  Snapshot snap(TH32CS_SNAPPROCESS);
+  if (!snap.valid()) return std::nullopt;
+
+  PROCESSENTRY32W entry{sizeof(entry)};
+  if (Process32FirstW(snap.get(), &entry)) {
     do {
-      if (iequals(e.szExeFile, exe)) {
-        CloseHandle(snap);
-        return e;
-      }
-    } while (Process32Next(snap, &e));
+      if (iequals(entry.szExeFile, exe)) return entry;
+    } while (Process32NextW(snap.get(), &entry));
   }
-  CloseHandle(snap);
   return std::nullopt;
 }
 
-[[nodiscard]] inline std::optional<MODULEENTRY32>
-get_module(HANDLE proc, const wchar_t* name) noexcept {
+[[nodiscard]] inline std::optional<MODULEENTRY32W>
+get_module(HANDLE proc, std::wstring_view name) noexcept {
   const DWORD pid = GetProcessId(proc);
-  const HANDLE snap = CreateToolhelp32Snapshot(k_snap_modules, pid);
-  if (snap == INVALID_HANDLE_VALUE) return std::nullopt;
+  Snapshot snap(kSnapModules, pid);
+  if (!snap.valid()) return std::nullopt;
 
-  MODULEENTRY32 m{sizeof(m)};
-  if (Module32First(snap, &m)) {
+  MODULEENTRY32W mod{sizeof(mod)};
+  if (Module32FirstW(snap.get(), &mod)) {
     do {
-      if (iequals(m.szModule, name)) {
-        CloseHandle(snap);
-        return m;
-      }
-    } while (Module32Next(snap, &m));
+      if (iequals(mod.szModule, name)) return mod;
+    } while (Module32NextW(snap.get(), &mod));
   }
-  CloseHandle(snap);
   return std::nullopt;
 }
 
 struct ModuleInfo {
-  MODULEENTRY32 mod;
+  MODULEENTRY32W mod;
   std::vector<IMAGE_SECTION_HEADER> sections;
 };
 
 [[nodiscard]] inline std::vector<IMAGE_SECTION_HEADER>
-read_sections(HANDLE proc, const MODULEENTRY32& mod) noexcept {
+read_sections(HANDLE proc, const MODULEENTRY32W& mod) noexcept {
   std::vector<IMAGE_SECTION_HEADER> out;
   IMAGE_DOS_HEADER dos{};
   if (!ReadProcessMemory(proc, mod.modBaseAddr, &dos, sizeof dos, nullptr) ||
@@ -90,21 +120,21 @@ read_sections(HANDLE proc, const MODULEENTRY32& mod) noexcept {
   return out;
 }
 
-[[nodiscard]] inline std::vector<ModuleInfo> list_modules(HANDLE proc) noexcept {
+[[nodiscard]] inline std::vector<ModuleInfo>
+list_modules(HANDLE proc) noexcept {
   std::vector<ModuleInfo> out;
   const DWORD pid = GetProcessId(proc);
-  const HANDLE snap = CreateToolhelp32Snapshot(k_snap_modules, pid);
-  if (snap == INVALID_HANDLE_VALUE) return out;
+  Snapshot snap(kSnapModules, pid);
+  if (!snap.valid()) return out;
 
-  MODULEENTRY32 me{sizeof(me)};
-  if (Module32First(snap, &me)) {
+  MODULEENTRY32W me{sizeof(me)};
+  if (Module32FirstW(snap.get(), &me)) {
     do {
       ModuleInfo mi{me, read_sections(proc, me)};
       out.push_back(std::move(mi));
-    } while (Module32Next(snap, &me));
+    } while (Module32NextW(snap.get(), &me));
   }
-  CloseHandle(snap);
   return out;
 }
 
-} // namespace utils::process 
+} // namespace utils::process
