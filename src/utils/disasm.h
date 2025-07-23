@@ -6,6 +6,8 @@
 #include <optional>
 #include <string>
 #include <bitset>
+#include <span>
+#include <vector>
 
 namespace utils::disasm {
 
@@ -33,12 +35,24 @@ decode(const void* code, size_t size) noexcept {
   return std::nullopt;
 }
 
+[[nodiscard]] inline std::optional<ZydisDecodedInstruction>
+decode(std::span<const uint8_t> bytes) noexcept {
+  return decode(bytes.data(), bytes.size());
+}
+
 template <typename Fn>
 inline void for_operands(const ZydisDecodedInstruction& inst, Fn&& fn) noexcept {
   for (uint8_t i = 0; i < inst.operand_count; ++i) {
     const auto& op = inst.operands[i];
     if (op.visibility != ZYDIS_OPERAND_VISIBILITY_HIDDEN) fn(op);
   }
+}
+
+[[nodiscard]] inline std::vector<ZydisDecodedOperand>
+operands(const ZydisDecodedInstruction& inst) noexcept {
+  std::vector<ZydisDecodedOperand> out;
+  for_operands(inst, [&](const ZydisDecodedOperand& op) { out.push_back(op); });
+  return out;
 }
 
 [[nodiscard]] inline std::string
@@ -59,7 +73,8 @@ inline constexpr bool same_register(ZydisRegister a, ZydisRegister b) noexcept {
   return to_64(a) == to_64(b);
 }
 
-inline ZydisRegister unused_gp(const ZydisDecodedInstruction& inst) noexcept {
+[[nodiscard]] inline std::optional<ZydisRegister>
+unused_gp(const ZydisDecodedInstruction& inst) noexcept {
   static constexpr ZydisRegister all[15] = {
       ZYDIS_REGISTER_RAX, ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX, ZYDIS_REGISTER_RBX,
       ZYDIS_REGISTER_RBP, ZYDIS_REGISTER_RSI, ZYDIS_REGISTER_RDI, ZYDIS_REGISTER_R8,
@@ -77,7 +92,7 @@ inline ZydisRegister unused_gp(const ZydisDecodedInstruction& inst) noexcept {
     }
   });
   for (size_t i = 0; i < 15; ++i) if (!used.test(i)) return all[i];
-  return ZYDIS_REGISTER_NONE;
+  return std::nullopt;
 }
 
 [[nodiscard]] inline std::optional<uint64_t>
@@ -101,6 +116,10 @@ inline bool is_branch(const ZydisDecodedInstruction& inst) noexcept {
 
 inline bool is_call(const ZydisDecodedInstruction& inst) noexcept {
   return inst.meta.category == ZYDIS_CATEGORY_CALL;
+}
+
+inline bool is_ret(const ZydisDecodedInstruction& inst) noexcept {
+  return inst.meta.category == ZYDIS_CATEGORY_RET;
 }
 
 } // namespace utils::disasm 
