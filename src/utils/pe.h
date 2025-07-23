@@ -1,40 +1,60 @@
 #pragma once
 
 // pe.h – small PE-image helper functions (header-only, no extras)
-//  * is_executable_page(DWORD prot)
-//  * is_invalid_alignment_section(const IMAGE_SECTION_HEADER&)
-//    (true when section is non-exec or its name contains "text")
+//  * IsExecutablePage(DWORD prot)
+//  * IsExecutableSection(const IMAGE_SECTION_HEADER&)
+//  * SectionName(const IMAGE_SECTION_HEADER&)
+//  * NameContains(const IMAGE_SECTION_HEADER&, const char*)
+//  * IsInvalidAlignmentSection(const IMAGE_SECTION_HEADER&)
 
 #include <Windows.h>
 #include <cstring>
+#include <string_view>
+#include <array>
 
 namespace utils::pe {
 
-// True if the protection flags indicate executable memory.
-[[nodiscard]] inline constexpr bool is_executable_page(DWORD prot) noexcept {
+constexpr size_t kPeNameLen = IMAGE_SIZEOF_SHORT_NAME;
+constexpr std::array<const char*, 1> kInvalidNames = {"text"};
+
+// Returns true if protection flags indicate executable memory.
+[[nodiscard]] inline constexpr bool IsExecutablePage(DWORD prot) noexcept {
   return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
          prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
 }
 
-constexpr size_t k_pe_name_len = 8;
+// Returns true if section header characteristics indicate executable memory.
+[[nodiscard]] inline constexpr bool IsExecutableSection(
+    const IMAGE_SECTION_HEADER& sec) noexcept {
+  return (sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+}
 
-// Case-insensitive ASCII substring search (max 8-byte PE section name).
-[[nodiscard]] inline bool name_contains(const IMAGE_SECTION_HEADER& sec,
-                                        const char* needle) noexcept {
-  char name[k_pe_name_len + 1]{};
-  memcpy(name, sec.Name, k_pe_name_len);
-  const size_t n_len = strlen(needle);
-  for (size_t i = 0; i + n_len <= k_pe_name_len && name[i]; ++i) {
-    if (_strnicmp(&name[i], needle, n_len) == 0) return true;
+// Returns the PE section name as a std::string_view.
+[[nodiscard]] inline std::string_view SectionName(
+    const IMAGE_SECTION_HEADER& sec) noexcept {
+  size_t len = strnlen(reinterpret_cast<const char*>(sec.Name), kPeNameLen);
+  return std::string_view(reinterpret_cast<const char*>(sec.Name), len);
+}
+
+// Case-insensitive substring match on section name.
+[[nodiscard]] inline bool NameContains(
+    const IMAGE_SECTION_HEADER& sec, const char* needle) noexcept {
+  std::string_view name = SectionName(sec);
+  const size_t needle_len = strlen(needle);
+  if (needle_len > name.size()) return false;
+  for (size_t i = 0; i + needle_len <= name.size(); ++i) {
+    if (_strnicmp(name.data() + i, needle, needle_len) == 0) return true;
   }
   return false;
 }
 
-[[nodiscard]] inline bool
-is_invalid_alignment_section(const IMAGE_SECTION_HEADER& sec) noexcept {
-  constexpr const char* k_text = "text";
-  return !(sec.Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
-         name_contains(sec, k_text);
+// Identifies sections that are either non-executable or match banned names.
+[[nodiscard]] inline bool IsInvalidAlignmentSection(
+    const IMAGE_SECTION_HEADER& sec) noexcept {
+  if (!IsExecutableSection(sec)) return true;
+  for (const char* banned : kInvalidNames)
+    if (NameContains(sec, banned)) return true;
+  return false;
 }
 
-} // namespace utils::pe 
+}  // namespace utils::pe
