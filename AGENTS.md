@@ -10,4 +10,4 @@ but they were not consistently writen, were badly written, and didn't capture al
 and the code these files were extremely fragile and unlikely to work with the latest version which requires you to reread the docs and exposed apis of these 3 projects
 than read the old utils, than focus on creating the perfect utils
 
-this is a 9 step process that likes much reverification and active steps to ensure correct and proper usage
+this is a 4 step process that likes much reverification and active steps to ensure correct and proper usage, in the summary u must show the 4 steps u took
