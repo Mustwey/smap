@@ -4,7 +4,8 @@
 //  assemble(const char* asm_text)        -> optional<vector<uint8_t>>
 //  assemble_fmt(const char* fmt, ...)    -> same, printf style
 
-#include <asmjit/asmjit.h>
+#include <asmjit/core.h>
+#include <asmjit/x86.h>
 #include <asmtk/asmtk.h>
 
 #include <cstdarg>
@@ -20,13 +21,16 @@ constexpr size_t k_stack_buf = 512;
 [[nodiscard]] inline std::optional<std::vector<uint8_t>>
 assemble(std::string_view text) noexcept {
   asmjit::CodeHolder code;
-  code.init(asmjit::CodeInfo(asmjit::ArchInfo::kIdX64));
+  asmjit::Environment env{asmjit::Arch::kX64};
+  if (code.init(env) != asmjit::kErrorOk)
+    return std::nullopt;
 
   asmjit::x86::Assembler a(&code);
   asmtk::AsmParser p(&a);
-  if (p.parse(text.data())) return std::nullopt;
+  if (p.parse(text.data(), text.size()) != asmjit::kErrorOk)
+    return std::nullopt;
 
-  const auto& buf = code.sectionById(0)->buffer();
+  const auto& buf = code.textSection()->buffer();
   return std::vector<uint8_t>(buf.data(), buf.data() + buf.size());
 }
 
