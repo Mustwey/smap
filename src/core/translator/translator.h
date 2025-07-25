@@ -2,8 +2,9 @@
 
 #include <Windows.h>
 #include <Zydis/Zydis.h>
-#include <memory>
+
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "core/region/region.h"
@@ -64,12 +65,14 @@ class Translator {
   bool Map(void*& entry);
 
   void* Translate(void* rva);
-  template <typename T> T Translate(T rva) {
+  template <typename T>
+  T Translate(T rva) {
     return reinterpret_cast<T>(Translate(reinterpret_cast<void*>(rva)));
   }
 
   void* TranslateRaw(void* rva);
-  template <typename T> T TranslateRaw(T rva) {
+  template <typename T>
+  T TranslateRaw(T rva) {
     return reinterpret_cast<T>(TranslateRaw(reinterpret_cast<void*>(rva)));
   }
   IMAGE_SECTION_HEADER* TranslateRawSection(void* rva);
