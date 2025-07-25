@@ -4,19 +4,19 @@
 #include "core/translator/translator.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <memory>
 #include <regex>
 #include <string>
-#include <array>
-#include <memory>
 
 #include "core/align/align.h"
 #include "core/translation/translation.h"
 #include "utils/assemble.h"
 #include "utils/disasm.h"
+#include "utils/log.h"
 #include "utils/pe.h"
 #include "utils/process.h"
-#include "utils/log.h"
 
 using utils::log::errorf;
 using utils::log::infof;
@@ -25,10 +25,10 @@ namespace {
 
 struct ScopedProtect {
   HANDLE proc;
-  void* addr;
+  void *addr;
   std::size_t size;
   DWORD old{};
-  ScopedProtect(HANDLE p, void* a, std::size_t s, DWORD prot)
+  ScopedProtect(HANDLE p, void *a, std::size_t s, DWORD prot)
       : proc{p}, addr{a}, size{s} {
     ::VirtualProtectEx(proc, addr, size, prot, &old);
   }
@@ -38,7 +38,7 @@ struct ScopedProtect {
   }
 };
 
-}  // unnamed namespace
+} // unnamed namespace
 
 namespace core {
 
@@ -58,15 +58,15 @@ bool Translator::Initialize(HANDLE process, PBYTE base) {
 
   nt->Signature = dos->e_magic = 0;
 
-  this->ProcessHandle = process;
-  this->ImageBase = base;
-  this->NtHeaders = nt;
+  this->process_handle_ = process;
+  this->image_base_ = base;
+  this->nt_headers_ = nt;
 
   if (!this->MapHeaders()) {
     return false;
   }
 
-  printf("[-] analyzing sections...\n");
+  infof("[-] analyzing sections...\n");
   auto section = IMAGE_FIRST_SECTION(nt);
   for (auto i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
     try {
@@ -81,7 +81,7 @@ bool Translator::Initialize(HANDLE process, PBYTE base) {
 
 // Maps the headers into the target process
 bool Translator::MapHeaders() {
-  auto sizeOfHeaders = this->NtHeaders->OptionalHeader.SizeOfHeaders;
+  auto sizeOfHeaders = this->nt_headers_->OptionalHeader.SizeOfHeaders;
   auto mapped = VirtualAllocEx(this->Process(), nullptr, sizeOfHeaders,
                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (!mapped) {
@@ -90,7 +90,7 @@ bool Translator::MapHeaders() {
   }
 
   this->AddTranslation(new RegionTranslation(
-      Region(0ULL, sizeOfHeaders), mapped, this->ImageBase, sizeOfHeaders));
+      Region(0ULL, sizeOfHeaders), mapped, this->image_base_, sizeOfHeaders));
   return true;
 }
 
@@ -98,7 +98,7 @@ bool Translator::MapHeaders() {
 std::vector<PVOID> Translator::GetExports() {
   std::vector<PVOID> exports;
 
-  auto rva = this->NtHeaders->OptionalHeader
+  auto rva = this->nt_headers_->OptionalHeader
                  .DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
                  .VirtualAddress;
   if (!rva) {
@@ -132,9 +132,9 @@ std::vector<PVOID> Translator::GetExports() {
 
 // Resolves the PE's imports
 bool Translator::ResolveImports() {
-  printf("[+] imports\n");
+  infof("[+] imports\n");
 
-  auto rva = this->NtHeaders->OptionalHeader
+  auto rva = this->nt_headers_->OptionalHeader
                  .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
                  .VirtualAddress;
   if (!rva) {
@@ -185,9 +185,9 @@ bool Translator::ResolveImports() {
 
 // Resolves the PE's relocations
 bool Translator::ResolveRelocations() {
-  printf("[+] relocations\n");
+  infof("[+] relocations\n");
 
-  auto &baseRelocDir = this->NtHeaders->OptionalHeader
+  auto &baseRelocDir = this->nt_headers_->OptionalHeader
                            .DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
   if (!baseRelocDir.VirtualAddress) {
     return true;
@@ -212,20 +212,21 @@ bool Translator::ResolveRelocations() {
       auto offset = data & 0xFFF;
 
       switch (type) {
-        case IMAGE_REL_BASED_ABSOLUTE:
-          break;
-        case IMAGE_REL_BASED_DIR64: {
-          auto &rva = *reinterpret_cast<PVOID *>(relocBase + offset);
+      case IMAGE_REL_BASED_ABSOLUTE:
+        break;
+      case IMAGE_REL_BASED_DIR64: {
+        auto &rva = *reinterpret_cast<PVOID *>(relocBase + offset);
 
-          rva = this->Translate(reinterpret_cast<PBYTE>(rva) -
-                                reinterpret_cast<PBYTE>(
-                                    this->NtHeaders->OptionalHeader.ImageBase));
+        rva =
+            this->Translate(reinterpret_cast<PBYTE>(rva) -
+                            reinterpret_cast<PBYTE>(
+                                this->nt_headers_->OptionalHeader.image_base_));
 
-          break;
-        }
-        default:
-          errorf("unsupported relocation type: %d\n", type);
-          return false;
+        break;
+      }
+      default:
+        errorf("unsupported relocation type: %d\n", type);
+        return false;
       }
     }
 
@@ -237,57 +238,52 @@ bool Translator::ResolveRelocations() {
 }
 
 // Returns the next jump size from the dest to src including instruction length
-static DWORD GetNextJumpSize(PVOID dest, PVOID src) {
-  auto diff = abs(static_cast<PBYTE>(dest) - static_cast<PBYTE>(src));
-  if (abs(diff - 2) <= 0x7F) {
-    return 2;
-  }
-
-  if (abs(diff - 5) <= 0x7FFFFFFF) {
-    return 5;
-  }
-
-  return 14;
+static DWORD NextJumpSize(void *dest, void *src) {
+  const auto diff = std::llabs(reinterpret_cast<std::intptr_t>(dest) -
+                               reinterpret_cast<std::intptr_t>(src));
+  if (diff <= 0x7F - kJumpShortSize)
+    return kJumpShortSize;
+  if (diff <= 0x7FFFFFFF - kJumpNearSize)
+    return kJumpNearSize;
+  return kJumpAbsoluteSize;
 }
 
 // Returns the next jump size from one region to another
-static DWORD GetNextJumpSize(std::vector<Region> &regions, SIZE_T regionIndex,
-                             SIZE_T regionEnd) {
-  if (regionIndex >= regionEnd - 1) {
-    return 14;
-  }
+static DWORD NextJumpSize(const std::vector<Region> &regions, std::size_t i,
+                          std::size_t end) {
+  if (i >= end - 1)
+    return kJumpAbsoluteSize;
+  auto diff = reinterpret_cast<std::intptr_t>(regions[i + 1].Start()) -
+              reinterpret_cast<std::intptr_t>(regions[i].End());
+  diff = std::llabs(diff);
 
-  auto diff = regions[regionIndex + 1].Start() - regions[regionIndex].End();
-  if (abs(diff) <= 0x7F) {
-    return 2;
-  }
-
-  if (abs(diff) <= 0x7FFFFFFF) {
-    return 5;
-  }
-
-  return 14;
+  if (diff <= 0x7F)
+    return kJumpShortSize;
+  if (diff <= 0x7FFFFFFF)
+    return kJumpNearSize;
+  return kJumpAbsoluteSize;
 }
 
 // Aligns an export in the given alignment regions
-Translation *Translator::AlignExport(SIZE_T &translationIndex,
-                                     SIZE_T translationsCount,
-                                     std::vector<Region> &regions,
-                                     SIZE_T regionStart, SIZE_T regionEnd) {
-  auto regionIndex = regionStart;
+Translation *Translator::AlignExport(std::size_t &translation_index,
+                                     std::size_t translations_count,
+                                     const std::vector<Region> &regions,
+                                     std::size_t region_begin,
+                                     std::size_t region_end) {
+  std::size_t regionIndex = region_begin;
   auto regionOffset = 0UL;
 
-  for (; translationIndex < translationsCount; ++translationIndex) {
-    auto &translation = this->Translations[translationIndex];
+  for (; translation_index < translations_count; ++translation_index) {
+    auto &translation = this->translations_[translation_index];
     if (!translation->Executable()) {
       continue;
     }
 
     auto region = &regions[regionIndex];
-    auto jumpSize = GetNextJumpSize(regions, regionIndex, regionEnd);
+    auto jumpSize = NextJumpSize(regions, regionIndex, region_end);
     while (regionOffset + translation->BufferSize() + jumpSize >
            region->Size()) {
-      if (regionIndex == regionEnd - 1) {
+      if (regionIndex == region_end - 1) {
         goto leftover;
       }
 
@@ -301,19 +297,19 @@ Translation *Translator::AlignExport(SIZE_T &translationIndex,
       auto jumpDest = regions[regionIndex + 1].Start();
 
       switch (jumpSize) {
-        case 2:
-          jumpInst[0] = 0xEB;
-          jumpInst[1] = static_cast<CHAR>(jumpDest - region->End());
-          break;
-        case 5:
-          jumpInst[0] = 0xE9;
-          *reinterpret_cast<PINT>(&jumpInst[1]) =
-              static_cast<INT>(jumpDest - region->End());
-          break;
-        case 14:
-          memcpy(jumpInst, "\xFF\x25\x00\x00\x00\x00", 6);
-          *reinterpret_cast<PVOID *>(&jumpInst[6]) = jumpDest;
-          break;
+      case 2:
+        jumpInst[0] = 0xEB;
+        jumpInst[1] = static_cast<CHAR>(jumpDest - region->End());
+        break;
+      case 5:
+        jumpInst[0] = 0xE9;
+        *reinterpret_cast<PINT>(&jumpInst[1]) =
+            static_cast<INT>(jumpDest - region->End());
+        break;
+      case 14:
+        memcpy(jumpInst, "\xFF\x25\x00\x00\x00\x00", 6);
+        *reinterpret_cast<PVOID *>(&jumpInst[6]) = jumpDest;
+        break;
       }
 
       auto jump =
@@ -323,7 +319,7 @@ Translation *Translator::AlignExport(SIZE_T &translationIndex,
 
       region = &regions[++regionIndex];
       regionOffset = 0;
-      jumpSize = GetNextJumpSize(regions, regionIndex, regionEnd);
+      jumpSize = NextJumpSize(regions, regionIndex, region_end);
     }
 
     translation->Mapped(region->Start() + regionOffset);
@@ -343,14 +339,15 @@ leftover:
 
 // Aligns the translations in the given alignment regions or newly created RX
 // regions
-bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
-  printf("\n[-] aligning code map\n");
+bool Translator::Align(const std::vector<Region> &regions,
+                       DWORD scatter_threshold) {
+  infof("\n[-] aligning code map\n");
 
   auto exports = this->GetExports();
   if (exports.size() == 0) {
-    printf("[+] no exports found\n");
+    infof("[+] no exports found\n");
   } else {
-    printf("[+] found %lld exports\n", exports.size());
+    infof("[+] found %lld exports\n", exports.size());
 
     if (regions.size() < exports.size()) {
       errorf("needed at least %lld regions, had %lld\n", exports.size(),
@@ -359,7 +356,7 @@ bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
     }
   }
 
-  auto translationsCount = this->Translations.size();
+  auto translations_count = this->translations_.size();
 
   // Evenly distribute region alignments among exports
   auto regionIncrement =
@@ -369,8 +366,8 @@ bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
   auto scatterIndex = 0ULL;
   Translation *lastJump = nullptr;
 
-  for (auto i = 0ULL; i < translationsCount; ++i) {
-    auto translation = this->Translations[i].get();
+  for (auto i = 0ULL; i < translations_count; ++i) {
+    auto translation = this->translations_[i].get();
     if (!translation->Executable()) {
       continue;
     }
@@ -383,22 +380,22 @@ bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
                                                   : (e + 1) * regionIncrement);
 
         auto exportStart = regions[regionStart].Start();
-        printf("[+] export %lld > %p\n", e, exportStart);
+        infof("[+] export %lld > %p\n", e, exportStart);
 
-        lastJump = this->AlignExport(i, translationsCount, regions, regionStart,
-                                     regionEnd);
+        lastJump = this->AlignExport(i, translations_count, regions,
+                                     regionStart, regionEnd);
         if (!lastJump) {
           return true;
         }
 
-        translation = this->Translations[i].get();
+        translation = this->translations_[i].get();
         scatterIndex = 0;
         scatterBase = nullptr;
         break;
       }
     }
 
-    if (scatterIndex == scatterThreshold) {
+    if (scatterIndex == scatter_threshold) {
       auto jumpBuffer = new BYTE[14]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
       auto jump = new ModifiedTranslation(Region(-1, 0UL), jumpBuffer, 14);
       jump->Mapped(scatterBase);
@@ -417,8 +414,9 @@ bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
       scatterBase += translation->BufferSize();
     } else {
       auto scatterSize = 14ULL;
-      for (auto e = i; e < i + scatterThreshold && e < translationsCount; ++e) {
-        auto &t = this->Translations[e];
+      for (auto e = i; e < i + scatter_threshold && e < translations_count;
+           ++e) {
+        auto &t = this->translations_[e];
         if (e > i && std::find(exports.begin(), exports.end(),
                                t->RVA().Start()) != exports.end()) {
           break;
@@ -437,22 +435,21 @@ bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
 
       if (lastJump) {
         auto buffer = static_cast<PBYTE>(lastJump->Buffer());
-        auto jumpSize = GetNextJumpSize(scatterBase, lastJump->Mapped());
+        auto jumpSize = NextJumpSize(scatterBase, lastJump->Mapped());
 
         switch (jumpSize) {
-          case 2:
-            buffer[0] = 0xEB;
-            buffer[1] =
-                static_cast<CHAR>(scatterBase - (lastJump->Mapped() + 2));
-            break;
-          case 5:
-            buffer[0] = 0xE9;
-            *reinterpret_cast<PINT>(&buffer[1]) =
-                static_cast<INT>(scatterBase - (lastJump->Mapped() + 5));
-            break;
-          case 14:
-            *reinterpret_cast<PVOID *>(&buffer[6]) = scatterBase;
-            break;
+        case 2:
+          buffer[0] = 0xEB;
+          buffer[1] = static_cast<CHAR>(scatterBase - (lastJump->Mapped() + 2));
+          break;
+        case 5:
+          buffer[0] = 0xE9;
+          *reinterpret_cast<PINT>(&buffer[1]) =
+              static_cast<INT>(scatterBase - (lastJump->Mapped() + 5));
+          break;
+        case 14:
+          *reinterpret_cast<PVOID *>(&buffer[6]) = scatterBase;
+          break;
         }
       }
 
@@ -468,7 +465,7 @@ bool Translator::Align(std::vector<Region> &regions, DWORD scatterThreshold) {
 
 // Resolves all relative references
 bool Translator::Resolve() {
-  printf("\n[-] resolving...\n");
+  infof("\n[-] resolving...\n");
 
   if (!this->ResolveImports()) {
     return false;
@@ -478,8 +475,8 @@ bool Translator::Resolve() {
     return false;
   }
 
-  printf("[+] relative instructions and jump tables\n");
-  for (auto &translation : this->Translations) {
+  infof("[+] relative instructions and jump tables\n");
+  for (auto &translation : this->translations_) {
     if (!translation->Resolve(*this)) {
       errorf("failed to resolve %p\n", translation->RVA().Start());
       return false;
@@ -493,13 +490,17 @@ bool Translator::Resolve() {
 bool Translator::Map(PVOID &entry) {
   infof("\n[-] mapping sections & code map\n");
 
-  for (auto &t : this->Translations) {
+  for (auto &t : this->translations_) {
     if (!t->BufferSize()) {
       continue;
     }
 
-    ScopedProtect pg{this->Process(), t->Mapped(), t->BufferSize(),
-                     PAGE_EXECUTE_READWRITE};
+    ProtectGuard pg{this->Process(), t->Mapped(), t->BufferSize(),
+                    PAGE_EXECUTE_READWRITE};
+    if (!pg.Success()) {
+      errorf("protect RWX failed\n");
+      return false;
+    }
 
     if (!WriteProcessMemory(this->Process(), t->Mapped(), t->Buffer(),
                             t->BufferSize(), nullptr)) {
@@ -508,18 +509,18 @@ bool Translator::Map(PVOID &entry) {
     }
   }
 
-  infof("[+] mapped %zu translations\n", this->Translations.size());
+  infof("[+] mapped %zu translations\n", this->translations_.size());
 
-  entry = this->Translate(
-      reinterpret_cast<PVOID>(this->NtHeaders->OptionalHeader.AddressOfEntryPoint));
+  entry = this->Translate(reinterpret_cast<PVOID>(
+      this->nt_headers_->OptionalHeader.AddressOfEntryPoint));
   infof("[+] entry point: %p\n", entry);
   return true;
 }
 
 // Returns the section header for the RVA
 PIMAGE_SECTION_HEADER Translator::TranslateRawSection(PVOID rva) {
-  auto section = IMAGE_FIRST_SECTION(this->NtHeaders);
-  for (auto i = 0; i < this->NtHeaders->FileHeader.NumberOfSections;
+  auto section = IMAGE_FIRST_SECTION(this->nt_headers_);
+  for (auto i = 0; i < this->nt_headers_->FileHeader.NumberOfSections;
        ++i, ++section) {
     if (Region(section->VirtualAddress, section->Misc.VirtualSize)
             .Contains(rva)) {
@@ -537,7 +538,7 @@ PVOID Translator::TranslateRaw(PVOID rva) {
     return nullptr;
   }
 
-  return this->ImageBase + section->PointerToRawData +
+  return this->image_base_ + section->PointerToRawData +
          (reinterpret_cast<PBYTE>(rva) -
           reinterpret_cast<PBYTE>(
               static_cast<UINT_PTR>(section->VirtualAddress)));
@@ -545,7 +546,7 @@ PVOID Translator::TranslateRaw(PVOID rva) {
 
 // Returns the mapped VA for the virtual RVA
 PVOID Translator::Translate(PVOID rva) {
-  auto size = static_cast<LONG64>(this->Translations.size());
+  auto size = static_cast<LONG64>(this->translations_.size());
   if (size == 0) {
     return nullptr;
   }
@@ -554,14 +555,14 @@ PVOID Translator::Translate(PVOID rva) {
   auto right = size - 1;
   while (left <= right) {
     auto middle = (left + right) / 2;
-    auto trans = this->Translations[middle].get();
+    auto trans = this->translations_[middle].get();
     if (trans->RVA().Contains(rva)) {
       while (middle - 1 >= 0 &&
-             this->Translations[middle - 1].get()->RVA().Contains(rva)) {
+             this->translations_[middle - 1].get()->RVA().Contains(rva)) {
         --middle;
       }
 
-      trans = this->Translations[middle].get();
+      trans = this->translations_[middle].get();
       return trans->Mapped() +
              (reinterpret_cast<PBYTE>(rva) - trans->RVA().Start());
     }
@@ -577,10 +578,10 @@ PVOID Translator::Translate(PVOID rva) {
 }
 
 // Adds a section for code analysis
-VOID Translator::AddSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
+void Translator::AddSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
   if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-    printf("[+] %-8s > (0x%X, 0x%X)\n", section->Name, section->VirtualAddress,
-           section->SizeOfRawData);
+    infof("[+] %-8s > (0x%X, 0x%X)\n", section->Name, section->VirtualAddress,
+          section->SizeOfRawData);
     this->AddExecuteSection(base, section);
   } else {
     auto mapped =
@@ -592,8 +593,8 @@ VOID Translator::AddSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
       throw TranslatorException();
     }
 
-    printf("[+] %-8s > %p (0x%X, 0x%X)\n", section->Name, mapped,
-           section->VirtualAddress, section->Misc.VirtualSize);
+    infof("[+] %-8s > %p (0x%X, 0x%X)\n", section->Name, mapped,
+          section->VirtualAddress, section->Misc.VirtualSize);
     this->AddTranslation(new RegionTranslation(
         Region(section->VirtualAddress, section->Misc.VirtualSize), mapped,
         base + section->PointerToRawData,
@@ -603,43 +604,44 @@ VOID Translator::AddSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
 
 // Traces backwards to find the first xref to the current translation at
 // translationIndex
-VOID Translator::TraceBranch(INT &translationIndex, INT startingIndex) {
-  auto rva = this->Translations[translationIndex]->RVA();
+void Translator::TraceBranch(int &translation_index, int starting_index) {
+  auto rva = this->translations_[translation_index]->RVA();
 
-  auto branch = this->Branches.find(rva.Start());
-  if (branch != this->Branches.end()) {
+  auto branch = this->branches_.find(rva.Start());
+  if (branch != this->branches_.end()) {
     auto xref = branch->second;
     if (xref < rva.Start()) {
-      for (; translationIndex >= startingIndex; --translationIndex) {
-        if (this->Translations[translationIndex]->RVA().Start() == xref) {
+      for (; translation_index >= starting_index; --translation_index) {
+        if (this->translations_[translation_index]->RVA().Start() == xref) {
           break;
         }
       }
 
-      while (translationIndex - 1 >= startingIndex &&
-             this->Translations[static_cast<SIZE_T>(translationIndex) - 1]
-                     ->RVA()
-                     .Start() == xref) {
-        --translationIndex;
+      while (
+          translation_index - 1 >= starting_index &&
+          this->translations_[static_cast<std::size_t>(translation_index) - 1]
+                  ->RVA()
+                  .Start() == xref) {
+        --translation_index;
       }
     }
   }
 }
 
 // Returns whether the given register refers to an absolute location in the PE
-bool Translator::IsRegisterAbsolute(ZydisRegister reg, INT translationIndex,
-                                    INT startingIndex, PVOID &absolute) {
+bool Translator::IsRegisterAbsolute(ZydisRegister reg, int translation_index,
+                                    int starting_index, void *&absolute) {
   if (utils::disasm::same_register(reg, ZYDIS_REGISTER_RSP)) {
     return false;
   }
 
-  for (auto i = translationIndex; i >= startingIndex; --i) {
-    auto prevTrans = this->Translations[i].get();
+  for (auto i = translation_index; i >= starting_index; --i) {
+    auto prevTrans = this->translations_[i].get();
     if (!prevTrans->Executable()) {
       continue;
     }
 
-    if (i != translationIndex) {
+    if (i != translation_index) {
       auto prevInst =
           utils::disasm::decode(prevTrans->Buffer(), prevTrans->BufferSize());
       if (prevInst.mnemonic == ZYDIS_MNEMONIC_INT3 ||
@@ -650,41 +652,38 @@ bool Translator::IsRegisterAbsolute(ZydisRegister reg, INT translationIndex,
       auto relativeTrans = dynamic_cast<RelativeTranslation *>(prevTrans);
       auto prevInstOperands = utils::disasm::operands(prevInst);
       switch (prevInstOperands.size()) {
-        case 1:
-          if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-              utils::disasm::same_register(prevInstOperands[0].reg.value,
-                                           reg)) {
+      case 1:
+        if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            utils::disasm::same_register(prevInstOperands[0].reg.value, reg)) {
+          return false;
+        }
+
+        break;
+      case 2:
+        if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            utils::disasm::same_register(prevInstOperands[0].reg.value, reg)) {
+          if (relativeTrans && prevInstOperands[1].imm.value.u != 0) {
+            absolute = reinterpret_cast<PVOID>(prevInstOperands[1].imm.value.u);
+            return true;
+          } else {
             return false;
           }
+        }
 
-          break;
-        case 2:
-          if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-              utils::disasm::same_register(prevInstOperands[0].reg.value,
-                                           reg)) {
-            if (relativeTrans && prevInstOperands[1].imm.value.u != 0) {
-              absolute =
-                  reinterpret_cast<PVOID>(prevInstOperands[1].imm.value.u);
-              return true;
-            } else {
-              return false;
-            }
-          }
-
-          break;
+        break;
       }
     }
 
-    this->TraceBranch(i, startingIndex);
+    this->TraceBranch(i, starting_index);
   }
 
   return false;
 }
 
 // Adds a jump table translation
-bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
-                                      ZydisDecodedInstruction &jumpInst) {
-  auto jumpOperands = utils::disasm::operands(jumpInst);
+bool Translator::AddSwitchTranslation(const Region &rva, const BYTE *jmp_buffer,
+                                      const ZydisDecodedInstruction &jmp_inst) {
+  auto jumpOperands = utils::disasm::operands(jmp_inst);
   if (jumpOperands.size() != 1 ||
       jumpOperands[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
     return false;
@@ -721,9 +720,9 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
     PVOID Mapped;
   } indirectJumpTable = {0};
 
-  for (INT i = static_cast<INT>(this->Translations.size()) - 1;
+  for (INT i = static_cast<INT>(this->translations_.size()) - 1;
        i >= 0 && !jumpTable.Cases && !indirectJumpTable.Cases; --i) {
-    auto prevTrans = this->Translations[i].get();
+    auto prevTrans = this->translations_[i].get();
     if (!prevTrans->Executable()) {
       continue;
     }
@@ -791,10 +790,9 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
         if (this->IsRegisterAbsolute(op1.mem.base, i, 0, jumpTable.RVA)) {
           jumpTable.IsRelative = true;
         } else {
-          errorf(
-              "failed to trace jump table base register to a valid table "
-              "(%p)\n",
-              rva.Start());
+          errorf("failed to trace jump table base register to a valid table "
+                 "(%p)\n",
+                 rva.Start());
           throw TranslatorException();
         }
       }
@@ -810,11 +808,11 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
         // LLVM - override the current index operand if we found a JA and
         // receive a CMP or SUB
         switch (prevInst.mnemonic) {
-          case ZYDIS_MNEMONIC_CMP:
-          case ZYDIS_MNEMONIC_SUB:
-            jumpTable.JumpAbove = false;
-            jumpTable.IndexOperand = op0;
-            break;
+        case ZYDIS_MNEMONIC_CMP:
+        case ZYDIS_MNEMONIC_SUB:
+          jumpTable.JumpAbove = false;
+          jumpTable.IndexOperand = op0;
+          break;
         }
       }
 
@@ -824,65 +822,63 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
            utils::disasm::same_register(op0.reg.value,
                                         jumpTable.IndexOperand.reg.value))) {
         switch (prevInst.mnemonic) {
-          case ZYDIS_MNEMONIC_CMP:
-          case ZYDIS_MNEMONIC_AND:
-          case ZYDIS_MNEMONIC_MOV:
-          case ZYDIS_MNEMONIC_MOVSX:
-          case ZYDIS_MNEMONIC_MOVSXD:
-          case ZYDIS_MNEMONIC_MOVZX:
-          case ZYDIS_MNEMONIC_SUB:
-            if (op1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-              if (indirectJumpTable.RVA) {
-                indirectJumpTable.Cases = op1.imm.value.u + 1;
-              } else {
-                jumpTable.Cases = op1.imm.value.u + 1;
-              }
-            } else if (op1.type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                       op1.mem.disp.has_displacement &&
-                       op1.mem.index != ZYDIS_REGISTER_NONE) {
-              jumpTable.IndexOperand = jumpOperands[0];
-              jumpTable.IndexOperand.reg.value =
-                  (op1.mem.index == jumpTable.LookupOperands[1].mem.base
-                       ? op1.mem.base
-                       : op1.mem.index);
-
-              indirectJumpTable.RVA =
-                  reinterpret_cast<PVOID>(op1.mem.disp.value);
-              indirectJumpTable.EntrySize = op1.mem.scale;
-              indirectJumpTable.LookupTranslationIndex = i;
-              indirectJumpTable.LookupInstruction = prevInst;
-              indirectJumpTable.LookupIndexRegister =
-                  jumpTable.IndexOperand.reg.value;
-              indirectJumpTable.LookupScale = op1.mem.scale;
+        case ZYDIS_MNEMONIC_CMP:
+        case ZYDIS_MNEMONIC_AND:
+        case ZYDIS_MNEMONIC_MOV:
+        case ZYDIS_MNEMONIC_MOVSX:
+        case ZYDIS_MNEMONIC_MOVSXD:
+        case ZYDIS_MNEMONIC_MOVZX:
+        case ZYDIS_MNEMONIC_SUB:
+          if (op1.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if (indirectJumpTable.RVA) {
+              indirectJumpTable.Cases = op1.imm.value.u + 1;
             } else {
-              jumpTable.IndexOperand = op1;
+              jumpTable.Cases = op1.imm.value.u + 1;
+            }
+          } else if (op1.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                     op1.mem.disp.has_displacement &&
+                     op1.mem.index != ZYDIS_REGISTER_NONE) {
+            jumpTable.IndexOperand = jumpOperands[0];
+            jumpTable.IndexOperand.reg.value =
+                (op1.mem.index == jumpTable.LookupOperands[1].mem.base
+                     ? op1.mem.base
+                     : op1.mem.index);
+
+            indirectJumpTable.RVA = reinterpret_cast<PVOID>(op1.mem.disp.value);
+            indirectJumpTable.EntrySize = op1.mem.scale;
+            indirectJumpTable.LookupTranslationIndex = i;
+            indirectJumpTable.LookupInstruction = prevInst;
+            indirectJumpTable.LookupIndexRegister =
+                jumpTable.IndexOperand.reg.value;
+            indirectJumpTable.LookupScale = op1.mem.scale;
+          } else {
+            jumpTable.IndexOperand = op1;
+          }
+
+          break;
+        case ZYDIS_MNEMONIC_LEA:
+          // LLVM - may decide to use LEA for the case count
+          if (op1.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+              op1.mem.base != ZYDIS_REGISTER_NONE &&
+              op1.mem.disp.has_displacement) {
+            if (indirectJumpTable.RVA) {
+              indirectJumpTable.Cases = op1.mem.disp.value + 1;
+            } else {
+              jumpTable.Cases = op1.mem.disp.value + 1;
             }
 
             break;
-          case ZYDIS_MNEMONIC_LEA:
-            // LLVM - may decide to use LEA for the case count
-            if (op1.type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                op1.mem.base != ZYDIS_REGISTER_NONE &&
-                op1.mem.disp.has_displacement) {
-              if (indirectJumpTable.RVA) {
-                indirectJumpTable.Cases = op1.mem.disp.value + 1;
-              } else {
-                jumpTable.Cases = op1.mem.disp.value + 1;
-              }
+          }
 
-              break;
-            }
-
-            // Intentional fallthrough
-          default:
-            errorf(
-                "unexpected instruction (%p, %s) with index operand while "
-                "parsing jump table (%p)",
-                prevTrans->RVA().Start(),
-                utils::disasm::format(prevInst, prevTrans->RVA().Start())
-                    .c_str(),
-                rva.Start());
-            throw TranslatorException();
+          // Intentional fallthrough
+        default:
+          errorf(
+              "unexpected instruction (%p, %s) with index operand while "
+              "parsing jump table (%p)",
+              prevTrans->RVA().Start(),
+              utils::disasm::format(prevInst, prevTrans->RVA().Start()).c_str(),
+              rva.Start());
+          throw TranslatorException();
         }
       }
     }
@@ -910,24 +906,24 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
       auto entry = rawIndirectJumpTable + (i * indirectJumpTable.EntrySize);
 
       switch (indirectJumpTable.EntrySize) {
-        case 1:
-          jumpTable.Cases =
-              std::max(static_cast<UINT_PTR>(*reinterpret_cast<PBYTE>(entry)),
-                       jumpTable.Cases);
-          break;
-        case 2:
-          jumpTable.Cases =
-              std::max(static_cast<UINT_PTR>(*reinterpret_cast<PUSHORT>(entry)),
-                       jumpTable.Cases);
-          break;
-        case 4:
-          jumpTable.Cases =
-              std::max(static_cast<UINT_PTR>(*reinterpret_cast<PUINT>(entry)),
-                       jumpTable.Cases);
-          break;
-        default:
-          errorf("bad indirect jump table scale\n");
-          throw TranslatorException();
+      case 1:
+        jumpTable.Cases =
+            std::max(static_cast<UINT_PTR>(*reinterpret_cast<PBYTE>(entry)),
+                     jumpTable.Cases);
+        break;
+      case 2:
+        jumpTable.Cases =
+            std::max(static_cast<UINT_PTR>(*reinterpret_cast<PUSHORT>(entry)),
+                     jumpTable.Cases);
+        break;
+      case 4:
+        jumpTable.Cases =
+            std::max(static_cast<UINT_PTR>(*reinterpret_cast<PUINT>(entry)),
+                     jumpTable.Cases);
+        break;
+      default:
+        errorf("bad indirect jump table scale\n");
+        throw TranslatorException();
       }
     }
 
@@ -997,7 +993,7 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
                             jumpTable.Mapped, indirectJumpTable.Mapped));
   this->RemoveTranslation(offset.TranslationIndex);
 
-  auto lookupRva = this->Translations[jumpTable.LookupTranslationIndex]->RVA();
+  auto lookupRva = this->translations_[jumpTable.LookupTranslationIndex]->RVA();
   auto unusedStr = ZydisRegisterGetString(
       utils::disasm::unused_gp(jumpTable.LookupInstruction));
 
@@ -1021,17 +1017,17 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
   if (indirectJumpTable.RVA) {
     // Rewrite the indirect jump table reference to be absolute
     lookupRva =
-        this->Translations[indirectJumpTable.LookupTranslationIndex]->RVA();
+        this->translations_[indirectJumpTable.LookupTranslationIndex]->RVA();
     unusedStr = ZydisRegisterGetString(
         utils::disasm::unused_gp(indirectJumpTable.LookupInstruction));
 
     this->ReplaceTranslation(
         indirectJumpTable.LookupTranslationIndex++,
         new ModifiedTranslation(lookupRva, "push %s", unusedStr));
-    this->InsertTranslation(
-        indirectJumpTable.LookupTranslationIndex++,
-        new ModifiedTranslation(lookupRva, "mov %s, 0x%p", unusedStr,
-                                indirectJumpTable.Mapped));
+    this->InsertTranslation(indirectJumpTable.LookupTranslationIndex++,
+                            new ModifiedTranslation(lookupRva, "mov %s, 0x%p",
+                                                    unusedStr,
+                                                    indirectJumpTable.Mapped));
 
     auto lookupStr = utils::disasm::format(indirectJumpTable.LookupInstruction,
                                            lookupRva.Start());
@@ -1052,171 +1048,171 @@ bool Translator::AddSwitchTranslation(Region &rva, PBYTE jumpBuffer,
 }
 
 // Adds a relative instruction translation
-VOID Translator::AddRelativeTranslation(Region &rva, PBYTE instructionBuffer,
-                                        ZydisDecodedInstruction &instruction) {
+void Translator::AddRelativeTranslation(
+    const Region &rva, const BYTE *instruction_buffer,
+    const ZydisDecodedInstruction &instruction) {
   auto operands = utils::disasm::operands(instruction);
   auto absoluteAddr = utils::disasm::absolute(rva.Start(), instruction);
 
   switch (instruction.mnemonic) {
-    case ZYDIS_MNEMONIC_LEA:
-      // Convert relative LEA to absolute
+  case ZYDIS_MNEMONIC_LEA:
+    // Convert relative LEA to absolute
 
-      this->AddTranslation(new RelativeTranslation(
-          rva, absoluteAddr, "mov %s, 0x%p",
-          ZydisRegisterGetString(operands[0].reg.value), ABSOLUTE_SIG));
-      break;
-    case ZYDIS_MNEMONIC_JMP:
-      // Convert relative direct jump to absolute
+    this->AddTranslation(new RelativeTranslation(
+        rva, absoluteAddr, "mov %s, 0x%p",
+        ZydisRegisterGetString(operands[0].reg.value), ABSOLUTE_SIG));
+    break;
+  case ZYDIS_MNEMONIC_JMP:
+    // Convert relative direct jump to absolute
 
-      if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        auto sizeOfRawData = 14;
-        auto rawData =
-            new BYTE[sizeOfRawData]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        auto rvaOffset = 6;
-        *reinterpret_cast<PVOID *>(&rawData[rvaOffset]) = absoluteAddr;
-
-        this->AddBranch(absoluteAddr, rva.Start());
-        this->AddTranslation(
-            new RelativeTranslation(rva, rawData, sizeOfRawData, rvaOffset));
-      } else {
-        this->AddTranslation(new RelativeTranslation(
-            rva, absoluteAddr, "mov r11, 0x%p", ABSOLUTE_SIG));
-        this->AddTranslation(new ModifiedTranslation(rva, "jmp [r11]"));
-      }
-
-      break;
-    case ZYDIS_MNEMONIC_CALL:
-      // Convert relative call to absolute
-
-      if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        auto sizeOfRawData = 16;
-        auto rawData = new BYTE[sizeOfRawData]{
-            0xFF, 0x15, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x08,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        auto rvaOffset = 8;
-        *reinterpret_cast<PVOID *>(&rawData[rvaOffset]) = absoluteAddr;
-
-        this->AddTranslation(
-            new RelativeTranslation(rva, rawData, sizeOfRawData, rvaOffset));
-      } else {
-        this->AddTranslation(new RelativeTranslation(
-            rva, absoluteAddr, "mov r11, 0x%p", ABSOLUTE_SIG));
-        this->AddTranslation(new ModifiedTranslation(rva, "call [r11]"));
-      }
-
-      break;
-    case ZYDIS_MNEMONIC_JB:
-    case ZYDIS_MNEMONIC_JBE:
-    case ZYDIS_MNEMONIC_JCXZ:
-    case ZYDIS_MNEMONIC_JECXZ:
-    case ZYDIS_MNEMONIC_JKNZD:
-    case ZYDIS_MNEMONIC_JKZD:
-    case ZYDIS_MNEMONIC_JL:
-    case ZYDIS_MNEMONIC_JLE:
-    case ZYDIS_MNEMONIC_JNB:
-    case ZYDIS_MNEMONIC_JNBE:
-    case ZYDIS_MNEMONIC_JNL:
-    case ZYDIS_MNEMONIC_JNLE:
-    case ZYDIS_MNEMONIC_JNO:
-    case ZYDIS_MNEMONIC_JNP:
-    case ZYDIS_MNEMONIC_JNS:
-    case ZYDIS_MNEMONIC_JNZ:
-    case ZYDIS_MNEMONIC_JO:
-    case ZYDIS_MNEMONIC_JP:
-    case ZYDIS_MNEMONIC_JRCXZ:
-    case ZYDIS_MNEMONIC_JS:
-    case ZYDIS_MNEMONIC_JZ: {
-      // Convert JCC to absolute
-
-      PBYTE rawData = nullptr;
-      PBYTE buffer = nullptr;
-      auto sizeOfRawData = 2 + 14;
-
-      if (instruction.length > 3) {
-        if (*instructionBuffer == 0xF2 || *instructionBuffer == 0xF3) {
-          sizeOfRawData += 3;
-          buffer = rawData = new BYTE[sizeOfRawData];
-          *buffer = *instructionBuffer;
-
-          ++instructionBuffer;
-          ++buffer;
-        } else {
-          sizeOfRawData += 2;
-          buffer = rawData = new BYTE[sizeOfRawData];
-        }
-
-        if (*instructionBuffer != 0x0F) {
-          errorf("found malformed relative long jump (%p)\n", rva.Start());
-          throw TranslatorException();
-        }
-
-        ++instructionBuffer;
-
-        *buffer = *instructionBuffer - 0x10;
-        ++buffer;
-      } else {
-        sizeOfRawData += instruction.length;
-        buffer = rawData = new BYTE[sizeOfRawData];
-
-        memcpy(buffer, instructionBuffer, instruction.length - 1);
-        buffer += (instruction.length - 1);
-      }
-
-      *buffer = 0x02;
-      ++buffer;
-
-      memcpy(buffer, "\xEB\x0E\xFF\x25\x00\x00\x00\x00", 8);
-      buffer += 8;
-
-      auto rvaOffset = static_cast<DWORD>(buffer - &rawData[0]);
-      *reinterpret_cast<PVOID *>(buffer) = absoluteAddr;
+    if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+      auto sizeOfRawData = 14;
+      auto rawData =
+          new BYTE[sizeOfRawData]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+      auto rvaOffset = 6;
+      *reinterpret_cast<PVOID *>(&rawData[rvaOffset]) = absoluteAddr;
 
       this->AddBranch(absoluteAddr, rva.Start());
       this->AddTranslation(
           new RelativeTranslation(rva, rawData, sizeOfRawData, rvaOffset));
-
-      break;
-    }
-    default: {
-      // Standard relative instruction
-      // Replace relative pointer with absolute register
-
-      auto unusedStr =
-          ZydisRegisterGetString(utils::disasm::unused_gp(instruction));
-
-      this->AddTranslation(new ModifiedTranslation(rva, "push %s", unusedStr));
+    } else {
       this->AddTranslation(new RelativeTranslation(
-          rva, absoluteAddr, "mov %s, 0x%p", unusedStr, ABSOLUTE_SIG));
-
-      auto instructionStr = utils::disasm::format(instruction, rva.Start());
-      instructionStr =
-          std::regex_replace(instructionStr, std::regex("\\[.*\\]"),
-                             "[" + std::string(unusedStr) + "]");
-      this->AddTranslation(
-          new ModifiedTranslation(rva, "%s", instructionStr.c_str()));
-
-      this->AddTranslation(new ModifiedTranslation(rva, "pop %s", unusedStr));
-
-      break;
+          rva, absoluteAddr, "mov r11, 0x%p", ABSOLUTE_SIG));
+      this->AddTranslation(new ModifiedTranslation(rva, "jmp [r11]"));
     }
+
+    break;
+  case ZYDIS_MNEMONIC_CALL:
+    // Convert relative call to absolute
+
+    if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+      auto sizeOfRawData = 16;
+      auto rawData = new BYTE[sizeOfRawData]{0xFF, 0x15, 0x02, 0x00, 0x00, 0x00,
+                                             0xEB, 0x08, 0x00, 0x00, 0x00, 0x00,
+                                             0x00, 0x00, 0x00, 0x00};
+      auto rvaOffset = 8;
+      *reinterpret_cast<PVOID *>(&rawData[rvaOffset]) = absoluteAddr;
+
+      this->AddTranslation(
+          new RelativeTranslation(rva, rawData, sizeOfRawData, rvaOffset));
+    } else {
+      this->AddTranslation(new RelativeTranslation(
+          rva, absoluteAddr, "mov r11, 0x%p", ABSOLUTE_SIG));
+      this->AddTranslation(new ModifiedTranslation(rva, "call [r11]"));
+    }
+
+    break;
+  case ZYDIS_MNEMONIC_JB:
+  case ZYDIS_MNEMONIC_JBE:
+  case ZYDIS_MNEMONIC_JCXZ:
+  case ZYDIS_MNEMONIC_JECXZ:
+  case ZYDIS_MNEMONIC_JKNZD:
+  case ZYDIS_MNEMONIC_JKZD:
+  case ZYDIS_MNEMONIC_JL:
+  case ZYDIS_MNEMONIC_JLE:
+  case ZYDIS_MNEMONIC_JNB:
+  case ZYDIS_MNEMONIC_JNBE:
+  case ZYDIS_MNEMONIC_JNL:
+  case ZYDIS_MNEMONIC_JNLE:
+  case ZYDIS_MNEMONIC_JNO:
+  case ZYDIS_MNEMONIC_JNP:
+  case ZYDIS_MNEMONIC_JNS:
+  case ZYDIS_MNEMONIC_JNZ:
+  case ZYDIS_MNEMONIC_JO:
+  case ZYDIS_MNEMONIC_JP:
+  case ZYDIS_MNEMONIC_JRCXZ:
+  case ZYDIS_MNEMONIC_JS:
+  case ZYDIS_MNEMONIC_JZ: {
+    // Convert JCC to absolute
+
+    PBYTE rawData = nullptr;
+    PBYTE buffer = nullptr;
+    auto sizeOfRawData = 2 + 14;
+
+    if (instruction.length > 3) {
+      if (*instruction_buffer == 0xF2 || *instruction_buffer == 0xF3) {
+        sizeOfRawData += 3;
+        buffer = rawData = new BYTE[sizeOfRawData];
+        *buffer = *instruction_buffer;
+
+        ++instruction_buffer;
+        ++buffer;
+      } else {
+        sizeOfRawData += 2;
+        buffer = rawData = new BYTE[sizeOfRawData];
+      }
+
+      if (*instruction_buffer != 0x0F) {
+        errorf("found malformed relative long jump (%p)\n", rva.Start());
+        throw TranslatorException();
+      }
+
+      ++instruction_buffer;
+
+      *buffer = *instruction_buffer - 0x10;
+      ++buffer;
+    } else {
+      sizeOfRawData += instruction.length;
+      buffer = rawData = new BYTE[sizeOfRawData];
+
+      memcpy(buffer, instruction_buffer, instruction.length - 1);
+      buffer += (instruction.length - 1);
+    }
+
+    *buffer = 0x02;
+    ++buffer;
+
+    memcpy(buffer, "\xEB\x0E\xFF\x25\x00\x00\x00\x00", 8);
+    buffer += 8;
+
+    auto rvaOffset = static_cast<DWORD>(buffer - &rawData[0]);
+    *reinterpret_cast<PVOID *>(buffer) = absoluteAddr;
+
+    this->AddBranch(absoluteAddr, rva.Start());
+    this->AddTranslation(
+        new RelativeTranslation(rva, rawData, sizeOfRawData, rvaOffset));
+
+    break;
+  }
+  default: {
+    // Standard relative instruction
+    // Replace relative pointer with absolute register
+
+    auto unusedStr =
+        ZydisRegisterGetString(utils::disasm::unused_gp(instruction));
+
+    this->AddTranslation(new ModifiedTranslation(rva, "push %s", unusedStr));
+    this->AddTranslation(new RelativeTranslation(
+        rva, absoluteAddr, "mov %s, 0x%p", unusedStr, ABSOLUTE_SIG));
+
+    auto instructionStr = utils::disasm::format(instruction, rva.Start());
+    instructionStr = std::regex_replace(instructionStr, std::regex("\\[.*\\]"),
+                                        "[" + std::string(unusedStr) + "]");
+    this->AddTranslation(
+        new ModifiedTranslation(rva, "%s", instructionStr.c_str()));
+
+    this->AddTranslation(new ModifiedTranslation(rva, "pop %s", unusedStr));
+
+    break;
+  }
   }
 }
 
 // Returns whether the register points to the base of the PE
-bool Translator::IsRegisterBase(ZydisRegister reg, INT translationIndex,
-                                INT startingIndex) {
+bool Translator::IsRegisterBase(ZydisRegister reg, int translation_index,
+                                int starting_index) {
   if (utils::disasm::same_register(reg, ZYDIS_REGISTER_RSP)) {
     return false;
   }
 
-  for (auto i = translationIndex; i >= startingIndex; --i) {
-    auto prevTrans = this->Translations[i].get();
+  for (auto i = translation_index; i >= starting_index; --i) {
+    auto prevTrans = this->translations_[i].get();
     if (!prevTrans->Executable()) {
       continue;
     }
 
-    if (i != translationIndex) {
+    if (i != translation_index) {
       auto prevInst =
           utils::disasm::decode(prevTrans->Buffer(), prevTrans->BufferSize());
       if (prevInst.mnemonic == ZYDIS_MNEMONIC_INT3 ||
@@ -1227,26 +1223,24 @@ bool Translator::IsRegisterBase(ZydisRegister reg, INT translationIndex,
       auto relativeTrans = dynamic_cast<RelativeTranslation *>(prevTrans);
       auto prevInstOperands = utils::disasm::operands(prevInst);
       switch (prevInstOperands.size()) {
-        case 1:
-          if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-              utils::disasm::same_register(prevInstOperands[0].reg.value,
-                                           reg)) {
-            return false;
-          }
+      case 1:
+        if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            utils::disasm::same_register(prevInstOperands[0].reg.value, reg)) {
+          return false;
+        }
 
-          break;
-        case 2:
-          if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-              utils::disasm::same_register(prevInstOperands[0].reg.value,
-                                           reg)) {
-            return relativeTrans && relativeTrans->Pointer() == nullptr;
-          }
+        break;
+      case 2:
+        if (prevInstOperands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            utils::disasm::same_register(prevInstOperands[0].reg.value, reg)) {
+          return relativeTrans && relativeTrans->Pointer() == nullptr;
+        }
 
-          break;
+        break;
       }
     }
 
-    this->TraceBranch(i, startingIndex);
+    this->TraceBranch(i, starting_index);
   }
 
   return false;
@@ -1254,9 +1248,9 @@ bool Translator::IsRegisterBase(ZydisRegister reg, INT translationIndex,
 
 // Fixes scaled-index-byte mode instructions that are relative the base of the
 // PE
-VOID Translator::FixSIB(INT translationIndex, INT startingIndex) {
+void Translator::FixSIB(int translation_index, int starting_index) {
   auto trans = dynamic_cast<DefaultTranslation *>(
-      this->Translations[translationIndex].get());
+      this->translations_[translation_index].get());
   if (!trans) {
     return;
   }
@@ -1281,17 +1275,18 @@ VOID Translator::FixSIB(INT translationIndex, INT startingIndex) {
     return;
   }
 
-  if (this->IsRegisterBase(sibOperand.mem.base, translationIndex,
-                           startingIndex)) {
+  if (this->IsRegisterBase(sibOperand.mem.base, translation_index,
+                           starting_index)) {
     auto unusedStr = ZydisRegisterGetString(utils::disasm::unused_gp(inst));
 
     // push unusedRegister
     this->ReplaceTranslation(
-        translationIndex++, new ModifiedTranslation(rva, "push %s", unusedStr));
+        translation_index++,
+        new ModifiedTranslation(rva, "push %s", unusedStr));
 
     // mov unusedRegister, absolutePointer
     this->InsertTranslation(
-        translationIndex++,
+        translation_index++,
         new RelativeTranslation(
             rva, reinterpret_cast<PVOID>(sibOperand.mem.disp.value),
             "mov %s, 0x%p", unusedStr, ABSOLUTE_SIG));
@@ -1304,24 +1299,25 @@ VOID Translator::FixSIB(INT translationIndex, INT startingIndex) {
 
     // Original instruction using absolutePointer as the base
     this->InsertTranslation(
-        translationIndex++,
+        translation_index++,
         new ModifiedTranslation(rva, "%s", instructionStr.c_str()));
 
     // pop unusedRegister
-    this->InsertTranslation(translationIndex,
+    this->InsertTranslation(translation_index,
                             new ModifiedTranslation(rva, "pop %s", unusedStr));
   } else if (sibOperand.mem.scale == 1 &&
-             this->IsRegisterBase(sibOperand.mem.index, translationIndex,
-                                  startingIndex)) {
+             this->IsRegisterBase(sibOperand.mem.index, translation_index,
+                                  starting_index)) {
     auto unusedStr = ZydisRegisterGetString(utils::disasm::unused_gp(inst));
 
     // push unusedRegister
     this->ReplaceTranslation(
-        translationIndex++, new ModifiedTranslation(rva, "push %s", unusedStr));
+        translation_index++,
+        new ModifiedTranslation(rva, "push %s", unusedStr));
 
     // mov unusedRegister, absolutePointer
     this->InsertTranslation(
-        translationIndex++,
+        translation_index++,
         new RelativeTranslation(
             rva, reinterpret_cast<PVOID>(sibOperand.mem.disp.value),
             "mov %s, 0x%p", unusedStr, ABSOLUTE_SIG));
@@ -1335,19 +1331,19 @@ VOID Translator::FixSIB(INT translationIndex, INT startingIndex) {
 
     // Original instruction using absolutePointer as the base
     this->InsertTranslation(
-        translationIndex++,
+        translation_index++,
         new ModifiedTranslation(rva, "%s", instructionStr.c_str()));
 
     // pop unusedRegister
-    this->InsertTranslation(translationIndex,
+    this->InsertTranslation(translation_index,
                             new ModifiedTranslation(rva, "pop %s", unusedStr));
   }
 }
 
 // Adds an executable code section
-VOID Translator::AddExecuteSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
+void Translator::AddExecuteSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
   // Do an initial pass to create a code map
-  auto startingSize = static_cast<INT>(this->Translations.size());
+  auto startingSize = static_cast<INT>(this->translations_.size());
   for (auto i = 0UL; i < section->SizeOfRawData;) {
     auto instBuffer = base + section->PointerToRawData + i;
     auto inst = utils::disasm::decode(instBuffer, section->SizeOfRawData - i);
@@ -1367,9 +1363,9 @@ VOID Translator::AddExecuteSection(PBYTE base, PIMAGE_SECTION_HEADER section) {
   }
 
   // Do a second pass analyzing relative SIB instructions utilizing the code map
-  for (auto i = startingSize; i < this->Translations.size(); ++i) {
+  for (auto i = startingSize; i < this->translations_.size(); ++i) {
     this->FixSIB(i, startingSize);
   }
 }
 \n
-}  // namespace core
+} // namespace core
