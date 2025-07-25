@@ -7,6 +7,8 @@
 #include <cstring>
 #include <regex>
 #include <string>
+#include <array>
+#include <memory>
 
 #include "core/align/align.h"
 #include "core/translation/translation.h"
@@ -14,6 +16,30 @@
 #include "utils/disasm.h"
 #include "utils/pe.h"
 #include "utils/process.h"
+#include "utils/log.h"
+
+using utils::log::errorf;
+using utils::log::infof;
+
+namespace {
+
+struct ScopedProtect {
+  HANDLE proc;
+  void* addr;
+  std::size_t size;
+  DWORD old{};
+  ScopedProtect(HANDLE p, void* a, std::size_t s, DWORD prot)
+      : proc{p}, addr{a}, size{s} {
+    ::VirtualProtectEx(proc, addr, size, prot, &old);
+  }
+  ~ScopedProtect() {
+    DWORD tmp;
+    ::VirtualProtectEx(proc, addr, size, old, &tmp);
+  }
+};
+
+}  // unnamed namespace
+
 namespace core {
 
 // Begins code analysis on the PE
@@ -465,36 +491,28 @@ bool Translator::Resolve() {
 
 // Maps the aligned code into the target process
 bool Translator::Map(PVOID &entry) {
-  printf("\n[-] mapping sections and code map\n");
+  infof("\n[-] mapping sections & code map\n");
 
   for (auto &t : this->Translations) {
     if (!t->BufferSize()) {
       continue;
     }
 
-    auto oldProtect = 0UL;
-    if (!VirtualProtectEx(this->Process(), t->Mapped(), t->BufferSize(),
-                          PAGE_EXECUTE_READWRITE, &oldProtect)) {
-      errorf("failed to set protection to RWX for %p\n", t->Mapped());
-      return false;
-    }
+    ScopedProtect pg{this->Process(), t->Mapped(), t->BufferSize(),
+                     PAGE_EXECUTE_READWRITE};
 
     if (!WriteProcessMemory(this->Process(), t->Mapped(), t->Buffer(),
                             t->BufferSize(), nullptr)) {
-      errorf("failed to write buffer to %p\n", t->Mapped());
+      errorf("WriteProcessMemory failed @%p\n", t->Mapped());
       return false;
     }
-
-    VirtualProtectEx(this->Process(), t->Mapped(), t->BufferSize(), oldProtect,
-                     &oldProtect);
   }
 
-  printf("[+] mapped %lld translations\n", this->Translations.size());
+  infof("[+] mapped %zu translations\n", this->Translations.size());
 
-  entry = this->Translate(this->NtHeaders->OptionalHeader.AddressOfEntryPoint);
-
-  printf("[+] entry point: %p\n", entry);
-
+  entry = this->Translate(
+      reinterpret_cast<PVOID>(this->NtHeaders->OptionalHeader.AddressOfEntryPoint));
+  infof("[+] entry point: %p\n", entry);
   return true;
 }
 
