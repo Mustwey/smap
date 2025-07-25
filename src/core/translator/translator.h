@@ -8,7 +8,7 @@
 
 #include "core/region/region.h"
 #include "core/translation/translation.h"
-#include "utils/error.h"
+#include "utils/log.h"
 
 namespace core {
 

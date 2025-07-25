@@ -9,7 +9,7 @@
 #include "core/region/region.h"
 #include "utils/assemble.h"
 #include "utils/signature.h"
-#include "utils/error.h"
+#include "utils/log.h"
 
 #define TranslatorException() (1)
 constexpr PVOID ABSOLUTE_SIG = reinterpret_cast<PVOID>(utils::sig::kAbsoluteSentinel);
